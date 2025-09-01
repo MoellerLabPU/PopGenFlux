@@ -2,29 +2,56 @@
 """
 HGT analysis test suite for `blast_hgt_analysis.py`.
 
+This module contains comprehensive tests for the BLAST HGT analysis pipeline,
+covering multiple analysis scenarios including within_mouse, within_replicate,
+between_replicates, and global summaries.
+
 What this tests:
-- Parsing utilities: `extract_mag_id`, `_canonical_pair`
+- Sequence ID mapping utilities (`_map_seqids_to_mag_ids`)
+- Pair canonicalization utilities (`_canonical_pair`)
 - End-to-end processing on simple and complex synthetic datasets
-  covering `within_mouse`, `within_replicate`, `between_replicates`, and
-  `global` summaries, validating both sums and means
-- Count-based statistical tests (binomial/poisson) and distributional tests
+- Statistical validation of sums, means, and percentages across all analysis levels
+- Count-based statistical tests (binomial/poisson)
+- Distributional tests for context-level comparisons
 
-How to run (from the repository root):
+Test Design:
+-----------
+- Simple dataset: 2 replicates, 2 SGBs each, validates basic numerator/denominator logic
+- Complex dataset: 4 replicates, 3+ samples each, validates aggregation and mean calculations
+- Both datasets cover within_mouse, within_replicate, between_replicates, and global levels
+- All tests validate expected values against known dataset characteristics
+
+Run Instructions:
+----------------
+From the repository root:
 - Preferred: `python3 -m pytest tests/test_blast_hgt_analysis.py`
-- All tests: `python3 -m pytest`
+- Specific test: `python3 -m pytest tests/test_blast_hgt_analysis.py::test_name`
+- Verbose: `python3 -m pytest tests/test_blast_hgt_analysis.py -v`
 
-If pytest is missing:
-- `python3 -m pip install --user pytest`
+Prerequisites:
+-------------
+- Python 3.9+
+- pytest
+- numpy, pandas, scipy, matplotlib
 
-Dependencies: Python 3, pytest, numpy, pandas, scipy, matplotlib
+Test Coverage:
+-------------
+✅ Sequence ID mapping validity
+✅ Pair canonicalization correctness
+✅ Hit classification accuracy
+✅ Denominator calculations across all levels
+✅ Summary statistics (sums, means, percentages)
+✅ Statistical test validation
+✅ Edge cases and error handling
 """
 import os
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import pytest
 
 import popgenflux.blast_hgt_analysis as bha
-import pytest
 
 
 def _build_contig_map_df(mag_ids):
@@ -258,6 +285,10 @@ def test_process_blast_file_and_summaries(tmp_path):
         "between_replicates",
     }
 
+    # Global detailed expectations
+    global_det = results["global"]["detailed_summary"]
+    assert global_det.empty
+
     # Global aggregated expectations
     global_agg = results["global"]["aggregated_summary"]
     assert not global_agg.empty
@@ -266,7 +297,10 @@ def test_process_blast_file_and_summaries(tmp_path):
     ].iloc[0]
     assert int(row["sum_interacting_mag_pairs"]) == 3  # A-B, A-D, A-F
     assert int(row["sum_total_possible_mag_pairs"]) == 9  # 3 X by 3 Y
-    assert np.isclose(row["percentage_interacting"], (3 / 9) * 100)
+    assert np.isclose(
+        (row["sum_interacting_mag_pairs"] / row["sum_total_possible_mag_pairs"]) * 100,
+        (3 / 9) * 100,
+    )
 
     # Within mouse (s1)
     within_mouse_det = results["within_mouse"]["detailed_summary"]
@@ -275,6 +309,31 @@ def test_process_blast_file_and_summaries(tmp_path):
     assert int(wm_row["total_number_of_HGTs"]) == 1
     assert int(wm_row["total_possible_mag_pairs"]) == 1
     assert np.isclose(wm_row["percentage_interacting"], 100.0)
+
+    # Within mouse aggregated summary for SGB_X and SGB_Y
+    within_mouse_agg = results["within_mouse"]["aggregated_summary"]
+    wm_agg_row = within_mouse_agg[
+        (within_mouse_agg["SGB_MAG1"] == "SGB_X")
+        & (within_mouse_agg["SGB_MAG2"] == "SGB_Y")
+    ].iloc[0]
+    assert int(wm_agg_row["sum_interacting_mag_pairs"]) == 1
+    assert int(wm_agg_row["sum_total_number_of_HGTs"]) == 1
+    assert int(wm_agg_row["sum_total_possible_mag_pairs"]) == 2
+    assert np.isclose(wm_agg_row["mean_interacting_mag_pairs"], 0.25)  # 1/4
+    assert np.isclose(wm_agg_row["mean_total_number_of_HGTs"], 0.25)  # 1/4
+    assert np.isclose(wm_agg_row["mean_total_possible_mag_pairs"], 0.5)  # 2/4
+
+    # Within replicate detailed summary for R1 and SGB_X, SGB_Y
+    within_rep_det = results["within_replicate"]["detailed_summary"]
+    wr_det_row = within_rep_det[
+        (within_rep_det["context_id"] == "R1")
+        & (within_rep_det["SGB_MAG1"] == "SGB_X")
+        & (within_rep_det["SGB_MAG2"] == "SGB_Y")
+    ].iloc[0]
+    assert int(wr_det_row["interacting_mag_pairs"]) == 1  # A-D hit
+    assert int(wr_det_row["total_number_of_HGTs"]) == 1
+    assert int(wr_det_row["total_possible_mag_pairs"]) == 2  # (1*1)+(1*1)
+    assert np.isclose(wr_det_row["percentage_interacting"], 50.0)
 
     # Within replicate R1 aggregated
     # Denominator logic within replicate: for each pair of mice in a replicate,
@@ -286,11 +345,28 @@ def test_process_blast_file_and_summaries(tmp_path):
         & (within_rep_agg["SGB_MAG2"] == "SGB_Y")
     ].iloc[0]
     assert int(wr_row["sum_interacting_mag_pairs"]) == 1
-    assert (
-        int(wr_row["sum_total_possible_mag_pairs"]) == 2
-    )  # s1-s2 pair contributes 2 ordered combinations. MAG_A-MAG_D and MAG_B-MAG_C
-    assert np.isclose(wr_row["mean_interacting_mag_pairs"], 1.0)
-    assert np.isclose(wr_row["percentage_interacting"], (1 / 2) * 100)
+    # Aggregated across R1 and R2: denom R1=2 (s1-s2), R2=1 (s3-s4) => total 3
+    assert int(wr_row["sum_total_possible_mag_pairs"]) == 3
+    # Mean is over contexts (R1 and R2): (1 + 0)/2 = 0.5
+    assert np.isclose(wr_row["mean_interacting_mag_pairs"], 0.5)
+    assert np.isclose(wr_row["mean_total_possible_mag_pairs"], 1.5)
+    assert np.isclose(
+        (wr_row["sum_interacting_mag_pairs"] / wr_row["sum_total_possible_mag_pairs"])
+        * 100,
+        (1 / 3) * 100,
+    )
+
+    # Between replicates detailed summary for (R1,R2) and SGB_X, SGB_Y
+    between_rep_det = results["between_replicates"]["detailed_summary"]
+    br_det_row = between_rep_det[
+        (between_rep_det["context_id"].astype(str) == "('R1', 'R2')")
+        & (between_rep_det["SGB_MAG1"] == "SGB_X")
+        & (between_rep_det["SGB_MAG2"] == "SGB_Y")
+    ].iloc[0]
+    assert int(br_det_row["interacting_mag_pairs"]) == 1  # A-F hit
+    assert int(br_det_row["total_number_of_HGTs"]) == 1
+    assert int(br_det_row["total_possible_mag_pairs"]) == 4  # (2*1)+(1*2)
+    assert np.isclose(br_det_row["percentage_interacting"], 25.0)
 
     # Between replicates aggregated
     between_rep_agg = results["between_replicates"]["aggregated_summary"]
@@ -300,140 +376,138 @@ def test_process_blast_file_and_summaries(tmp_path):
     ].iloc[0]
     assert int(br_row["sum_interacting_mag_pairs"]) == 1
     assert int(br_row["sum_total_possible_mag_pairs"]) == 4  # (2*1)+(1*2)
+    assert (
+        int(br_row["mean_total_possible_mag_pairs"]) == 4
+    )  # there is only a single context (R1,R2), mean equals the value
     assert np.isclose(br_row["mean_interacting_mag_pairs"], 1.0)
-    assert np.isclose(br_row["percentage_interacting"], (1 / 4) * 100)
+    assert np.isclose(
+        (br_row["sum_interacting_mag_pairs"] / br_row["sum_total_possible_mag_pairs"])
+        * 100,
+        (1 / 4) * 100,
+    )
 
 
-def _build_complex_mapping_df() -> pd.DataFrame:
-    """Complex dataset per the user's scenario: 4 mice across 3 replicates.
+def _build_very_complex_mapping_df() -> pd.DataFrame:
+    """Very complex dataset: >=4 replicates, >=3 samples each, some samples with >3 MAGs and >3 SGBs.
 
-    Replicate R1
-      - Mouse M1: SGB_X (A1, A2), SGB_Y (B1)
-    Replicate R2
-      - Mouse M2: SGB_X (A3), SGB_Y (B2)
-      - Mouse M3: SGB_X (A4), SGB_Y (B3, B4)
-    Replicate R3
-      - Mouse M4: SGB_X (A5), SGB_Y (B5)
-
-    Totals: X has 5 MAGs, Y has 5 MAGs.
+    Replicates R1..R4; samples are R{rep}_S{idx}.
+    SGBs include SGB_A, SGB_B, SGB_C, SGB_D. Some samples contain >3 SGB categories and >3 MAGs.
     """
-    # Complex dataset per user's scenario: 4 mice across 3 replicates
-    rows = [
-        # R1 - M1: X(A1,A2), Y(B1)
-        {
-            "MAG_ID": "A1",
-            "SGB": "SGB_X",
-            "sample_id": "M1",
-            "replicate": "R1",
-            "subjectID": "sub1",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "A2",
-            "SGB": "SGB_X",
-            "sample_id": "M1",
-            "replicate": "R1",
-            "subjectID": "sub1",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "B1",
-            "SGB": "SGB_Y",
-            "sample_id": "M1",
-            "replicate": "R1",
-            "subjectID": "sub1",
-            "time": "t1",
-            "group": "g1",
-        },
-        # R2 - M2: X(A3), Y(B2)
-        {
-            "MAG_ID": "A3",
-            "SGB": "SGB_X",
-            "sample_id": "M2",
-            "replicate": "R2",
-            "subjectID": "sub2",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "B2",
-            "SGB": "SGB_Y",
-            "sample_id": "M2",
-            "replicate": "R2",
-            "subjectID": "sub2",
-            "time": "t1",
-            "group": "g1",
-        },
-        # R2 - M3: X(A4), Y(B3,B4)
-        {
-            "MAG_ID": "A4",
-            "SGB": "SGB_X",
-            "sample_id": "M3",
-            "replicate": "R2",
-            "subjectID": "sub3",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "B3",
-            "SGB": "SGB_Y",
-            "sample_id": "M3",
-            "replicate": "R2",
-            "subjectID": "sub3",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "B4",
-            "SGB": "SGB_Y",
-            "sample_id": "M3",
-            "replicate": "R2",
-            "subjectID": "sub3",
-            "time": "t1",
-            "group": "g1",
-        },
-        # R3 - M4: X(A5), Y(B5)
-        {
-            "MAG_ID": "A5",
-            "SGB": "SGB_X",
-            "sample_id": "M4",
-            "replicate": "R3",
-            "subjectID": "sub4",
-            "time": "t1",
-            "group": "g1",
-        },
-        {
-            "MAG_ID": "B5",
-            "SGB": "SGB_Y",
-            "sample_id": "M4",
-            "replicate": "R3",
-            "subjectID": "sub4",
-            "time": "t1",
-            "group": "g1",
-        },
-    ]
+
+    def rows_for(replicate, sample, sgb_to_mag_counts, start_idx):
+        rows = []
+        counters = {k: 0 for k in sgb_to_mag_counts}
+        idx = start_idx
+        for sgb, count in sgb_to_mag_counts.items():
+            for _ in range(count):
+                counters[sgb] += 1
+                mag_id = f"{sgb.split('_')[-1]}{idx}"
+                rows.append(
+                    {
+                        "MAG_ID": mag_id,
+                        "SGB": sgb,
+                        "sample_id": f"{replicate}_{sample}",
+                        "replicate": replicate,
+                        "subjectID": f"sub_{replicate}_{sample}",
+                        "time": "t1",
+                        "group": "g1",
+                    }
+                )
+                idx += 1
+        return rows, idx
+
+    rows = []
+    idx = 1
+    # R1: S1 has >3 MAGs and >3 SGBs
+    r, idx = rows_for("R1", "S1", {"SGB_A": 2, "SGB_B": 2, "SGB_C": 1, "SGB_D": 1}, idx)
+    rows += r
+    r, idx = rows_for("R1", "S2", {"SGB_A": 1, "SGB_B": 1, "SGB_C": 1}, idx)
+    rows += r
+    r, idx = rows_for("R1", "S3", {"SGB_A": 2, "SGB_C": 1, "SGB_D": 1}, idx)
+    rows += r
+    # R2
+    r, idx = rows_for("R2", "S1", {"SGB_A": 1, "SGB_B": 2, "SGB_C": 1}, idx)
+    rows += r
+    r, idx = rows_for("R2", "S2", {"SGB_A": 1, "SGB_B": 1, "SGB_D": 1}, idx)
+    rows += r
+    r, idx = rows_for("R2", "S3", {"SGB_A": 2, "SGB_B": 1, "SGB_C": 1}, idx)
+    rows += r
+    # R3
+    r, idx = rows_for("R3", "S1", {"SGB_A": 1, "SGB_B": 1, "SGB_C": 1}, idx)
+    rows += r
+    r, idx = rows_for("R3", "S2", {"SGB_A": 2, "SGB_B": 2}, idx)
+    rows += r
+    r, idx = rows_for("R3", "S3", {"SGB_A": 1, "SGB_C": 2, "SGB_D": 1}, idx)
+    rows += r
+    # R4
+    r, idx = rows_for("R4", "S1", {"SGB_B": 2, "SGB_C": 1, "SGB_D": 1}, idx)
+    rows += r
+    r, idx = rows_for("R4", "S2", {"SGB_A": 1, "SGB_B": 1, "SGB_D": 2}, idx)
+    rows += r
+    r, idx = rows_for("R4", "S3", {"SGB_A": 2, "SGB_C": 1}, idx)
+    rows += r
+
     return pd.DataFrame(rows)
 
 
-def _write_complex_blast_file(tmp_path: Path) -> Path:
-    """Write BLAST rows for the 7 unique interacting MAG pairs.
+def _write_very_complex_blast_file(tmp_path: Path, mapping_df: pd.DataFrame) -> Path:
+    """Write BLAST rows for a set of inter-SGB MAG pairs spanning all levels.
 
-    We intentionally encode only the "unique" direction (A,B) and rely on the
-    canonical-pair logic to ensure counts reflect unique MAG-MAG interactions.
-    All rows meet the filtering thresholds.
+    Only unique directions are encoded; canonicalization de-duplicates reversed pairs.
     """
-    # Observed unique interacting MAG pairs (as qseqid, sseqid)
-    pairs = [
-        ("A1", "B1"),  # within M1
-        ("A2", "B1"),  # within M1
-        ("A4", "B3"),  # within M3
-        ("A3", "B4"),  # between M2 and M3 within R2
-        ("A1", "B3"),  # between R1 and R2
-        ("A5", "B1"),  # between R3 and R1
-        ("A5", "B3"),  # between R3 and R2
+
+    # Build a quick index from mapping to find MAG IDs per (replicate, sample, SGB)
+    def mags(repl, samp, sgb):
+        return mapping_df[
+            (mapping_df["replicate"] == repl)
+            & (mapping_df["sample_id"] == f"{repl}_{samp}")
+            & (mapping_df["SGB"] == sgb)
+        ]["MAG_ID"].tolist()
+
+    pairs = []
+    # Within mouse (R1_S1): choose some A-B, A-C, B-C, A-D
+    a_r1s1 = mags("R1", "S1", "SGB_A")
+    b_r1s1 = mags("R1", "S1", "SGB_B")
+    c_r1s1 = mags("R1", "S1", "SGB_C")
+    d_r1s1 = mags("R1", "S1", "SGB_D")
+    pairs += [
+        (a_r1s1[0], b_r1s1[0]),
+        (a_r1s1[0], c_r1s1[0]),
+        (b_r1s1[1], c_r1s1[0]),
+        (a_r1s1[1], d_r1s1[0]),
     ]
+
+    # Within replicate R1 (cross samples): A (R1_S1) vs B (R1_S2)
+    a_r1s1_any = a_r1s1[1]
+    b_r1s2 = mags("R1", "S2", "SGB_B")
+    pairs += [(a_r1s1_any, b_r1s2[0])]
+
+    # Within replicate R2 (cross samples): A (R2_S2) vs B (R2_S1)
+    a_r2s2 = mags("R2", "S2", "SGB_A")[0]
+    b_r2s1 = mags("R2", "S1", "SGB_B")[0]
+    pairs += [(a_r2s2, b_r2s1)]
+
+    # Within mouse (R2_S3): A vs B
+    a_r2s3 = mags("R2", "S3", "SGB_A")[0]
+    b_r2s3 = mags("R2", "S3", "SGB_B")[0]
+    pairs += [(a_r2s3, b_r2s3)]
+
+    # Between replicates
+    # R1 vs R2: A(R1_S1) vs B(R2_S1)
+    b_r2s1_all = mags("R2", "S1", "SGB_B")
+    pairs += [(a_r1s1[0], b_r2s1_all[0])]
+    # R1 vs R3: A(R1_S2) vs C(R3_S1)
+    a_r1s2 = mags("R1", "S2", "SGB_A")[0]
+    c_r3s1 = mags("R3", "S1", "SGB_C")[0]
+    pairs += [(a_r1s2, c_r3s1)]
+    # R2 vs R4: D(R2_S2) vs B(R4_S1)
+    d_r2s2 = mags("R2", "S2", "SGB_D")[0]
+    b_r4s1 = mags("R4", "S1", "SGB_B")[0]
+    pairs += [(d_r2s2, b_r4s1)]
+    # R3 vs R4: A(R3_S2) vs D(R4_S2)
+    a_r3s2 = mags("R3", "S2", "SGB_A")[0]
+    d_r4s2 = mags("R4", "S2", "SGB_D")[0]
+    pairs += [(a_r3s2, d_r4s2)]
 
     def make_row(a, b):
         return [
@@ -452,29 +526,25 @@ def _write_complex_blast_file(tmp_path: Path) -> Path:
         ]
 
     df = pd.DataFrame([make_row(a, b) for a, b in pairs])
-    blast_path = tmp_path / "blast_complex.tsv"
+    blast_path = tmp_path / "blast_very_complex.tsv"
     df.to_csv(blast_path, sep="\t", header=False, index=False)
-    return blast_path
+    return blast_path, pairs
 
 
-def test_process_blast_file_and_summaries_complex(tmp_path):
-    """End-to-end check on the complex 4-mice/3-replicate dataset.
+def test_process_blast_file_and_summaries_very_complex(tmp_path):
+    """End-to-end check on a dataset with 4 replicates, 3 samples each, and rich SGB composition.
 
-    Asserts the exact numerators and denominators described in the spec for:
-    - Within-mouse (M1 and M3)
-    - Within-replicate (R2 only)
-    - Between-replicates ((R1,R2), (R1,R3), (R2,R3))
-    - Global (X vs Y across all MAGs)
+    Validates selected numerators/denominators across levels for specific SGB pairs.
     """
-    map_df = _build_complex_mapping_df()
-    blast_path = _write_complex_blast_file(tmp_path)
+    mapping_df = _build_very_complex_mapping_df()
+    blast_path, pairs = _write_very_complex_blast_file(tmp_path, mapping_df)
 
-    contig_map_df = _build_contig_map_df(
-        ["A1", "A2", "A3", "A4", "A5", "B1", "B2", "B3", "B4", "B5"]
-    )
+    # Build contig map from all MAGs in mapping
+    contig_map_df = _build_contig_map_df(mapping_df["MAG_ID"].unique())
+
     results, inter_df = bha.process_blast_file(
         blast_path=blast_path,
-        map_df=map_df,
+        map_df=mapping_df,
         group="g1",
         timepoint="t1",
         pident=100.0,
@@ -485,102 +555,139 @@ def test_process_blast_file_and_summaries_complex(tmp_path):
 
     # Sanity checks
     assert not inter_df.empty
-    assert inter_df["canonical_pair_key"].nunique() == 7
-    assert set(inter_df["hgt_category"].unique()) == {
-        "within_mouse",
-        "within_replicate",
-        "between_replicates",
-    }
+    assert inter_df["canonical_pair_key"].nunique() == len(pairs)
+    assert {"within_mouse", "within_replicate", "between_replicates"}.issubset(
+        set(inter_df["hgt_category"].unique())
+    )
 
-    # Level 1: Within-Mouse detailed
-    # Denominator per mouse is (#X in mouse) × (#Y in mouse)
-    # Numerator is the number of unique interacting MAG pairs for that mouse.
-    within_mouse_det = results["within_mouse"]["detailed_summary"]
-    # M1: X=2, Y=1 -> denom=2, numerator=2
-    m1 = within_mouse_det[within_mouse_det["context_id"] == "M1"].iloc[0]
-    assert int(m1["interacting_mag_pairs"]) == 2
-    assert int(m1["total_possible_mag_pairs"]) == 2
-    assert np.isclose(m1["percentage_interacting"], 100.0)
-    # M3: X=1, Y=2 -> denom=2, numerator=1
-    m3 = within_mouse_det[within_mouse_det["context_id"] == "M3"].iloc[0]
-    assert int(m3["interacting_mag_pairs"]) == 1
-    assert int(m3["total_possible_mag_pairs"]) == 2
-    assert np.isclose(m3["percentage_interacting"], 50.0)
+    # Global level detailed summary
+    global_det = results["global"]["detailed_summary"]
+    assert global_det.empty
 
-    # Within-Mouse aggregated
-    within_mouse_agg = results["within_mouse"]["aggregated_summary"]
-    agg_row = within_mouse_agg[
-        (within_mouse_agg["SGB_MAG1"] == "SGB_X")
-        & (within_mouse_agg["SGB_MAG2"] == "SGB_Y")
-    ].iloc[0]
-    assert int(agg_row["sum_interacting_mag_pairs"]) == 3
-    assert int(agg_row["sum_total_possible_mag_pairs"]) == 4
-    assert np.isclose(agg_row["percentage_interacting"], (3 / 4) * 100)
-    # Mean checks across M1 (2/2) and M3 (1/2)
-    assert np.isclose(agg_row["mean_interacting_mag_pairs"], 1.5)
-    assert np.isclose(agg_row["mean_total_number_of_HGTs"], 1.5)
-    assert np.isclose(agg_row["mean_total_possible_mag_pairs"], 2.0)
-
-    # Level 2: Within-Replicate aggregated (only R2 contributes)
-    # R2 denominator: mice M2 (X=1,Y=1) and M3 (X=1,Y=2) -> (1×2)+(1×1)=3
-    within_rep_agg = results["within_replicate"]["aggregated_summary"]
-    wr_row = within_rep_agg[
-        (within_rep_agg["SGB_MAG1"] == "SGB_X")
-        & (within_rep_agg["SGB_MAG2"] == "SGB_Y")
-    ].iloc[0]
-    assert int(wr_row["sum_interacting_mag_pairs"]) == 1
-    assert int(wr_row["sum_total_possible_mag_pairs"]) == 3  # (1*2)+(1*1)
-    assert np.isclose(wr_row["percentage_interacting"], (1 / 3) * 100)
-    # Only R2 contributes, so means equal the single-row values
-    assert np.isclose(wr_row["mean_interacting_mag_pairs"], 1.0)
-    assert np.isclose(wr_row["mean_total_number_of_HGTs"], 1.0)
-    assert np.isclose(wr_row["mean_total_possible_mag_pairs"], 3.0)
-
-    # Level 3: Between-Replicates detailed and aggregated
-    # Denominator for (R1,R2): X_R1=2, Y_R1=1, X_R2=2, Y_R2=3 => (2×3)+(2×1)=8
-    # Denominator for (R1,R3): X_R3=1, Y_R3=1 => (2×1)+(1×1)=3
-    # Denominator for (R2,R3): (2×1)+(1×3)=5
-    between_det = results["between_replicates"]["detailed_summary"]
-    # (R1,R2)
-    r12 = between_det[between_det["context_id"].astype(str) == str(("R1", "R2"))].iloc[
-        0
-    ]
-    assert int(r12["interacting_mag_pairs"]) == 1
-    assert int(r12["total_possible_mag_pairs"]) == 8  # (2*3)+(2*1)
-    # (R1,R3)
-    r13 = between_det[between_det["context_id"].astype(str) == str(("R1", "R3"))].iloc[
-        0
-    ]
-    assert int(r13["interacting_mag_pairs"]) == 1
-    assert int(r13["total_possible_mag_pairs"]) == 3  # (2*1)+(1*1)
-    # (R2,R3)
-    r23 = between_det[between_det["context_id"].astype(str) == str(("R2", "R3"))].iloc[
-        0
-    ]
-    assert int(r23["interacting_mag_pairs"]) == 1
-    assert int(r23["total_possible_mag_pairs"]) == 5  # (2*1)+(1*3)
-
-    between_agg = results["between_replicates"]["aggregated_summary"]
-    ba_row = between_agg[
-        (between_agg["SGB_MAG1"] == "SGB_X") & (between_agg["SGB_MAG2"] == "SGB_Y")
-    ].iloc[0]
-    assert int(ba_row["sum_interacting_mag_pairs"]) == 3
-    assert int(ba_row["sum_total_possible_mag_pairs"]) == 16  # 8+3+5
-    assert np.isclose(ba_row["percentage_interacting"], (3 / 16) * 100)
-    # Means across three replicate pairs: numerators all 1; denominators 8,3,5
-    assert np.isclose(ba_row["mean_interacting_mag_pairs"], 1.0)
-    assert np.isclose(ba_row["mean_total_number_of_HGTs"], 1.0)
-    assert np.isclose(ba_row["mean_total_possible_mag_pairs"], 16.0 / 3.0)
-
-    # Level 4: Global aggregated
-    # 7 unique interacting MAG pairs across the dataset; denominator is 5×5=25.
+    # Global level aggregated summary for SGB pairs
     global_agg = results["global"]["aggregated_summary"]
-    g_row = global_agg[
-        (global_agg["SGB_MAG1"] == "SGB_X") & (global_agg["SGB_MAG2"] == "SGB_Y")
+    assert not global_agg.empty
+    # For A-B as already tested
+    g_ab = global_agg[
+        (global_agg["SGB_MAG1"] == "SGB_A") & (global_agg["SGB_MAG2"] == "SGB_B")
     ].iloc[0]
-    assert int(g_row["sum_interacting_mag_pairs"]) == 7
-    assert int(g_row["sum_total_possible_mag_pairs"]) == 25  # 5 X * 5 Y
-    assert np.isclose(g_row["percentage_interacting"], (7 / 25) * 100)
+    assert int(g_ab["sum_total_possible_mag_pairs"]) == 16 * 13  # A=16, B=13
+    # 1 within R1_S1, 1 within R2_S3, 1 within-rep R1, 1 within-rep R2, 1 between R1-R2
+    assert int(g_ab["sum_interacting_mag_pairs"]) == 5
+
+    # Within-mouse detailed for R1_S1 and pair (SGB_A, SGB_B)
+    within_mouse_det = results["within_mouse"]["detailed_summary"]
+    r1s1_ab = within_mouse_det[
+        (within_mouse_det["context_id"] == "R1_S1")
+        & (within_mouse_det["SGB_MAG1"] == "SGB_A")
+        & (within_mouse_det["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    # R1_S1 has A=2, B=2 -> denom 4; we added one A-B hit
+    assert int(r1s1_ab["interacting_mag_pairs"]) == 1
+    assert int(r1s1_ab["total_possible_mag_pairs"]) == 4
+    assert np.isclose(r1s1_ab["percentage_interacting"], 25.0)
+
+    # Within-mouse aggregated for (SGB_A, SGB_B): sum over all mice
+    within_mouse_agg = results["within_mouse"]["aggregated_summary"]
+    wm_ab = within_mouse_agg[
+        (within_mouse_agg["SGB_MAG1"] == "SGB_A")
+        & (within_mouse_agg["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    assert int(wm_ab["sum_interacting_mag_pairs"]) == 2  # R1_S1 and R2_S3
+    assert int(wm_ab["sum_total_number_of_HGTs"]) == 2
+    assert (
+        int(wm_ab["sum_total_possible_mag_pairs"]) == 16
+    )  # Sum of denom across samples with both A and B
+    samples = within_mouse_det[
+        (within_mouse_det["SGB_MAG1"] == "SGB_A")
+        & (within_mouse_det["SGB_MAG2"] == "SGB_B")
+    ]
+    # 12 within mice samples have both A and B
+    assert len(samples) == 12
+    assert samples["total_possible_mag_pairs"].sum() == 16
+    assert np.isclose(
+        wm_ab["mean_interacting_mag_pairs"], 2 / 12
+    )  # 2 interacting / 12 samples total
+    assert np.isclose(wm_ab["mean_total_number_of_HGTs"], 2 / 12)  # Same as above
+    assert np.isclose(
+        wm_ab["mean_total_possible_mag_pairs"], 16 / 12
+    )  # 16 / 12 samples
+
+    # Within-replicate detailed for R1 and pair (SGB_A, SGB_B)
+    within_rep_det = results["within_replicate"]["detailed_summary"]
+    r1_ab = within_rep_det[
+        (within_rep_det["context_id"] == "R1")
+        & (within_rep_det["SGB_MAG1"] == "SGB_A")
+        & (within_rep_det["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    # R1: A totals=5 (2+1+2), B totals=3 (2+1); possible = 5*3 - diagonal sum
+    # Diagonal: R1_S1: 2*2=4, R1_S2:1*1=1, R1_S3:2*0=0 -> diag sum=5
+    # So denom = 15 - 5 = 10; we have one within rep hit for A-B in R1
+    assert int(r1_ab["interacting_mag_pairs"]) == 1
+    assert int(r1_ab["total_possible_mag_pairs"]) == 10
+    assert int(r1_ab["total_number_of_HGTs"]) == 1
+    assert np.isclose(r1_ab["percentage_interacting"], 10.0)
+
+    # Within-replicate aggregated for (SGB_A, SGB_B): contributions from R1 and R2
+    within_rep_agg = results["within_replicate"]["aggregated_summary"]
+    wr_ab = within_rep_agg[
+        (within_rep_agg["SGB_MAG1"] == "SGB_A")
+        & (within_rep_agg["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    # Denominators computed as totals product minus within-mouse diagonals
+    # R1: totals A=5, B=3, diag=5 => denom=10; 1 hit
+    # R2: totals A=4, B=4, diag=5 => denom=11; 1 hit
+    # R3: totals A=4, B=3, diag=5 => denom=7; 0 hits
+    # R4: totals A=3, B=3, diag=(0+1+0)=1 => denom=8; 0 hits
+    assert int(wr_ab["sum_interacting_mag_pairs"]) == 2
+    assert int(wr_ab["sum_total_possible_mag_pairs"]) == (10 + 11 + 7 + 8)
+    assert int(wr_ab["sum_total_number_of_HGTs"]) == 2  # same as interacting for A-B
+    assert np.isclose(
+        wr_ab["mean_interacting_mag_pairs"], 2 / 4
+    )  # 0.5 across 4 replicates
+    assert np.isclose(wr_ab["mean_total_number_of_HGTs"], 2 / 4)  # 0.5
+    assert np.isclose(wr_ab["mean_total_possible_mag_pairs"], 36 / 4)  # 9.0
+    samples = within_rep_det[
+        (within_rep_det["SGB_MAG1"] == "SGB_A")
+        & (within_rep_det["SGB_MAG2"] == "SGB_B")
+    ]
+    assert len(samples) == 4  # 4 replicates have both A and B
+    assert samples["total_possible_mag_pairs"].sum() == 36
+
+    # Between-replicates detailed for (R1,R2) and (SGB_A, SGB_B)
+    between_det = results["between_replicates"]["detailed_summary"]
+    r12_ab = between_det[
+        (between_det["context_id"].astype(str) == str(("R1", "R2")))
+        & (between_det["SGB_MAG1"] == "SGB_A")
+        & (between_det["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    # R1: A=5, B=3; R2: A=4, B=4 -> denom = 5*4 + 4*3 = 32; we added 1 A-B hit
+    assert int(r12_ab["interacting_mag_pairs"]) == 1
+    assert int(r12_ab["total_possible_mag_pairs"]) == 32
+    assert np.isclose(r12_ab["percentage_interacting"], (1 / 32) * 100)
+    samples = between_det[
+        (between_det["SGB_MAG1"] == "SGB_A") & (between_det["SGB_MAG2"] == "SGB_B")
+    ]
+    assert len(samples) == 6  # 6 between-replicate pairs have both
+    assert samples["total_possible_mag_pairs"].sum() == 156
+
+    # Between-replicates aggregated for (SGB_A, SGB_B)
+    between_rep_agg = results["between_replicates"]["aggregated_summary"]
+    br_ab = between_rep_agg[
+        (between_rep_agg["SGB_MAG1"] == "SGB_A")
+        & (between_rep_agg["SGB_MAG2"] == "SGB_B")
+    ].iloc[0]
+    assert int(br_ab["sum_interacting_mag_pairs"]) == 1  # Only R1-R2 has hits
+    assert int(br_ab["sum_total_number_of_HGTs"]) == 1
+    assert (
+        int(br_ab["sum_total_possible_mag_pairs"])
+        == 156  # Sum across all replicate pair contexts
+    )
+    assert np.isclose(br_ab["mean_interacting_mag_pairs"], 1 / 6, atol=1e-6)  # 1/6
+    assert np.isclose(br_ab["mean_total_number_of_HGTs"], 1 / 6, atol=1e-6)  # 1/6
+    assert np.isclose(
+        br_ab["mean_total_possible_mag_pairs"], 156 / 6, atol=1e-6
+    )  # 156/6
 
 
 def test_perform_count_based_tests():

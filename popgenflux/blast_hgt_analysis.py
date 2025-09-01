@@ -71,6 +71,8 @@ BLAST_COLS = [
     "bitscore",
 ]
 
+EPS = 1e-12
+
 # Set up a global logger for the script. This allows logging from any function.
 logger = logging.getLogger(__name__)
 
@@ -84,9 +86,17 @@ def _map_seqids_to_mag_ids(
     Expected gene ID shape: contigID_geneID (contig and gene separated by an underscore).
     Mapping uses the prefix before the last underscore as the contig ID.
 
-    The contig map must contain columns 'contig_id' and 'mag_id'.
+    Args:
+        seqids: pandas Series containing BLAST sequence IDs (gene IDs)
+        contig_map_df: DataFrame with columns 'contig_id' and 'mag_id' for mapping
 
-    Raises a SystemExit if any sequence ID cannot be mapped to a MAG.
+    Returns:
+        pandas Series of MAG IDs corresponding to input sequence IDs
+
+    Raises:
+        ValueError: If contig_map_df is missing required columns
+        SystemExit: If any sequence ID cannot be mapped to a MAG or if
+                   duplicate contig mappings are found
     """
     if (
         "contig_id" not in contig_map_df.columns
@@ -157,301 +167,395 @@ def _canonical_pair(a: pd.Series, b: pd.Series) -> tuple[pd.Series, pd.Series]:
 def generate_level_summaries(
     inter_sgb_df: pd.DataFrame, context_map_df: pd.DataFrame
 ) -> dict:
-    """Generate detailed and aggregated summaries at multiple analysis levels.
+    """
+    Generate detailed and aggregated summaries for all analysis levels.
 
-    Computes per-SGB-pair metrics across four levels:
-    - global
-    - within_mouse (stratified by `sample_id`)
-    - within_replicate (stratified by `replicate` excluding within-mouse)
-    - between_replicates (pairs of replicates)
+    This function creates comprehensive summaries of HGT (horizontal gene transfer)
+    interactions between SGB (Species Genome Bin) pairs across four hierarchical
+    analysis levels: global, within_mouse, within_replicate, and between_replicates.
 
-    For each level, returns:
-    - detailed_summary: per-context rows with counts and denominators
-    - aggregated_summary: per-SGB-pair sums/means and denominators
-
-    Expected columns in `inter_sgb_df` include: `SGB1`, `SGB2`, `MAG1`, `MAG2`,
-    `sample_id1`, `sample_id2`, `replicate1`, `replicate2`, and a precomputed
-    `canonical_pair_key`.
+    The function first builds a complete "scaffold" of all possible SGB pair contexts,
+    calculates theoretical denominators (total possible MAG-MAG interactions), and
+    then merges the observed hit counts to compute interaction percentages.
 
     Args:
-        inter_sgb_df: Filtered BLAST hits mapped to context, only inter-SGB rows.
-        context_map_df: Mapping rows for the relevant group/time with columns
-            `MAG_ID`, `SGB`, `sample_id`, `replicate`.
+        inter_sgb_df: DataFrame containing classified inter-SGB hits with columns:
+            - SGB1_canonical, SGB2_canonical: Canonical SGB pair identifiers
+            - canonical_pair_key: Unique MAG pair identifier
+            - hgt_category: Classification level (within_mouse, within_replicate, between_replicates)
+            - sample_id1, sample_id2: Sample identifiers for each hit
+            - replicate1, replicate2: Replicate identifiers for each hit
+        context_map_df: DataFrame mapping MAGs to experimental context with columns:
+            - MAG_ID: MAG identifier
+            - SGB: Species Genome Bin identifier
+            - sample_id: Sample/mouse identifier
+            - replicate: Experimental replicate identifier
 
     Returns:
-        Dict keyed by level name where each value is a dict with keys
-        `detailed_summary` and `aggregated_summary` holding DataFrames.
+        dict: Nested dictionary with structure:
+            {
+                'level_name': {
+                    'detailed_summary': DataFrame with context-stratified results,
+                    'aggregated_summary': DataFrame with SGB-pair level aggregates
+                }
+            }
+            where level_name is one of: 'global', 'within_mouse', 'within_replicate', 'between_replicates'
+
+    Note:
+        - Global level has no detailed_summary (returns empty DataFrame)
+        - Denominators represent theoretical maximum MAG-MAG interactions
+        - Percentages calculated as (observed interactions / theoretical maximum) * 100
     """
+    # Initialize results dictionary to store summaries for each analysis level
     results = {}
 
-    # --- Define Analysis Levels ---
-    # Create a dictionary of DataFrames, one for each analysis level.
-    # Using .copy() here prevents SettingWithCopyWarning when modifying these slices later.
+    # Create master list of all unique SGB identifiers from the context mapping
+    all_sgbs = sorted(context_map_df["SGB"].dropna().unique())
+
+    # Generate all possible SGB pairs for global-level analysis scaffold
+    # This ensures we capture all potential interactions, even those with zero hits
+    master_sgb_pairs_df = pd.DataFrame(
+        list(combinations(all_sgbs, 2)), columns=["SGB_MAG1", "SGB_MAG2"]
+    )
+
+    # Define analysis levels and their corresponding data subsets
+    # Each level represents a different biological/experimental scale
     analysis_levels = {
-        "global": inter_sgb_df,
+        "global": inter_sgb_df,  # All inter-SGB hits regardless of context
         "within_mouse": inter_sgb_df[
             inter_sgb_df["hgt_category"] == "within_mouse"
-        ].copy(),
+        ].copy(),  # Hits within the same individual mouse
         "within_replicate": inter_sgb_df[
             inter_sgb_df["hgt_category"] == "within_replicate"
-        ].copy(),
+        ].copy(),  # Hits within same replicate but different mice
         "between_replicates": inter_sgb_df[
             inter_sgb_df["hgt_category"] == "between_replicates"
-        ].copy(),
+        ].copy(),  # Hits between different experimental replicates
     }
 
-    # --- Loop Through Each Level ---
-    for level, df_subset in analysis_levels.items():
-        logger.info(
-            f"Calculating summaries for '{level}' level ({len(df_subset):,} hits where SGB1 != SGB2)..."
+    # Check for missing data that could affect context-specific analyses
+    num_missing_samples = context_map_df["sample_id"].isna().sum()
+    num_missing_replicates = context_map_df["replicate"].isna().sum()
+    if num_missing_samples:
+        logger.warning(
+            f"{num_missing_samples} rows have missing sample_id; they are excluded from context scaffolds."
+        )
+    if num_missing_replicates:
+        logger.warning(
+            f"{num_missing_replicates} rows have missing replicate; they are excluded from replicate-based scaffolds."
         )
 
-        if df_subset.empty:
-            results[level] = {
-                "detailed_summary": pd.DataFrame(),
-                "aggregated_summary": pd.DataFrame(),
-            }
-            continue
+    # Process each analysis level separately
+    for level, hits_subset in analysis_levels.items():
+        logger.info(f"Generating summaries for '{level}' level...")
 
-        # --- Within-Mouse Level (Stratified) ---
+        # Initialize empty scaffold - will be populated based on analysis level
+        scaffold_df = pd.DataFrame()
+
+        # === LEVEL-SPECIFIC SCAFFOLD GENERATION ===
+        # Each level requires different denominator calculations based on context
+
         if level == "within_mouse":
-            # Group hits by the specific mouse and SGB pair where they occurred.
-            detailed_summary = (
-                df_subset.groupby(["sample_id1", "SGB1_canonical", "SGB2_canonical"])
-                .agg(
-                    interacting_mag_pairs=("canonical_pair_key", "nunique"),
-                    total_number_of_HGTs=("canonical_pair_key", "size"),
+            # For within-mouse analysis: calculate possible MAG pairs within each mouse
+            scaffold_rows = []
+
+            # Count unique MAGs per SGB per mouse (sample_id)
+            mag_counts_per_mouse = (
+                context_map_df.dropna(subset=["sample_id"])
+                .groupby(["sample_id", "SGB"])["MAG_ID"]
+                .nunique()
+                .unstack(
+                    fill_value=0
+                )  # Pivot: rows=sample_id, cols=SGB, values=MAG_count
+            )
+
+            if not mag_counts_per_mouse.empty:
+                sgb_columns = list(mag_counts_per_mouse.columns)
+
+                # For each SGB pair, calculate possible MAG interactions per mouse
+                for sgb_first, sgb_second in combinations(sgb_columns, 2):
+                    # Denominator = MAGs_in_SGB1 × MAGs_in_SGB2 for each mouse
+                    possible_pairs_per_mouse = (
+                        mag_counts_per_mouse[sgb_first]
+                        * mag_counts_per_mouse[sgb_second]
+                    ).rename("total_possible_mag_pairs")
+
+                    # Convert to DataFrame and add SGB pair information
+                    mouse_context_df = possible_pairs_per_mouse.reset_index().rename(
+                        columns={"sample_id": "context_id"}
+                    )
+                    mouse_context_df["SGB_MAG1"], mouse_context_df["SGB_MAG2"] = (
+                        sgb_first,
+                        sgb_second,
+                    )
+                    scaffold_rows.append(mouse_context_df)
+
+            # Combine all scaffold rows or create empty DataFrame with expected columns
+            scaffold_df = (
+                pd.concat(scaffold_rows, ignore_index=True)
+                if scaffold_rows
+                else pd.DataFrame(
+                    columns=[
+                        "context_id",
+                        "SGB_MAG1",
+                        "SGB_MAG2",
+                        "total_possible_mag_pairs",
+                    ]
                 )
-                .reset_index()
             )
 
-            def get_mouse_denominator(row):
-                mouse_context = context_map_df[
-                    context_map_df["sample_id"] == row["sample_id1"]
-                ]
-                sgb1_count = mouse_context[
-                    mouse_context["SGB"] == row["SGB1_canonical"]
-                ]["MAG_ID"].nunique()
-                sgb2_count = mouse_context[
-                    mouse_context["SGB"] == row["SGB2_canonical"]
-                ]["MAG_ID"].nunique()
-                return sgb1_count * sgb2_count
-
-            detailed_summary["total_possible_mag_pairs"] = detailed_summary.apply(
-                get_mouse_denominator, axis=1
-            )
-
-            detailed_summary.rename(
-                columns={
-                    "sample_id1": "context_id",
-                    "SGB1_canonical": "SGB_MAG1",
-                    "SGB2_canonical": "SGB_MAG2",
-                },
-                inplace=True,
-            )
-
-            # Create the aggregated summary by calculating both the sum and mean of the detailed results.
-            aggregated_summary = (
-                detailed_summary.groupby(["SGB_MAG1", "SGB_MAG2"])
-                .agg(
-                    sum_interacting_mag_pairs=("interacting_mag_pairs", "sum"),
-                    mean_interacting_mag_pairs=("interacting_mag_pairs", "mean"),
-                    sum_total_number_of_HGTs=("total_number_of_HGTs", "sum"),
-                    mean_total_number_of_HGTs=("total_number_of_HGTs", "mean"),
-                    sum_total_possible_mag_pairs=("total_possible_mag_pairs", "sum"),
-                    mean_total_possible_mag_pairs=("total_possible_mag_pairs", "mean"),
-                )
-                .reset_index()
-            )
-
-            results[level] = {
-                "detailed_summary": detailed_summary,
-                "aggregated_summary": aggregated_summary,
-            }
-
-        # --- Within-Replicate Level (Stratified) ---
         elif level == "within_replicate":
-            stratified_summary = (
-                df_subset.groupby(["replicate1", "SGB1_canonical", "SGB2_canonical"])
-                .agg(
-                    interacting_mag_pairs=("canonical_pair_key", "nunique"),
-                    total_number_of_HGTs=("canonical_pair_key", "size"),
-                )
-                .reset_index()
-            )
+            # For within-replicate analysis: calculate cross-mouse MAG pairs within replicates
+            scaffold_rows = []
 
-            def get_replicate_denominator(row):
-                rep_context = context_map_df[
-                    context_map_df["replicate"] == row["replicate1"]
-                ]
-                counts_per_mouse = (
-                    rep_context.groupby(["sample_id", "SGB"])["MAG_ID"]
+            # Process each replicate separately
+            for replicate_id, replicate_df in context_map_df.dropna(
+                subset=["replicate"]
+            ).groupby("replicate"):
+                # Create contingency table: rows=sample_id, cols=SGB, values=MAG_count
+                mag_contingency_table = (
+                    replicate_df.groupby(["sample_id", "SGB"])["MAG_ID"]
                     .nunique()
                     .unstack(fill_value=0)
                 )
-                total_pairs = 0
-                for m1, m2 in combinations(counts_per_mouse.index, 2):
-                    m1_sgb1 = counts_per_mouse.loc[m1].get(row["SGB1_canonical"], 0)
-                    m1_sgb2 = counts_per_mouse.loc[m1].get(row["SGB2_canonical"], 0)
-                    m2_sgb2 = counts_per_mouse.loc[m2].get(row["SGB2_canonical"], 0)
-                    m2_sgb1 = counts_per_mouse.loc[m2].get(row["SGB1_canonical"], 0)
-                    total_pairs += (m1_sgb1 * m2_sgb2) + (m2_sgb1 * m1_sgb2)
-                return total_pairs
 
-            stratified_summary["total_possible_mag_pairs"] = stratified_summary.apply(
-                get_replicate_denominator, axis=1
+                if mag_contingency_table.empty:
+                    continue
+
+                sgb_columns = list(mag_contingency_table.columns)
+                # Sum MAGs across all mice in this replicate for each SGB
+                total_mags_per_sgb = mag_contingency_table.sum(axis=0)
+
+                # For each SGB pair, calculate cross-mouse interactions within replicate
+                for sgb_first, sgb_second in combinations(sgb_columns, 2):
+                    # Diagonal term: sum of (MAGs_in_SGB1 × MAGs_in_SGB2) within each mouse
+                    # This represents within-mouse interactions that should be excluded
+                    within_mouse_pairs = (
+                        mag_contingency_table[sgb_first]
+                        * mag_contingency_table[sgb_second]
+                    ).sum()
+
+                    # Total possible pairs minus within-mouse pairs = between-mouse pairs
+                    between_mouse_pairs = int(
+                        total_mags_per_sgb.get(sgb_first, 0)
+                        * total_mags_per_sgb.get(sgb_second, 0)
+                        - within_mouse_pairs
+                    )
+
+                    scaffold_rows.append(
+                        {
+                            "context_id": replicate_id,
+                            "SGB_MAG1": sgb_first,
+                            "SGB_MAG2": sgb_second,
+                            "total_possible_mag_pairs": between_mouse_pairs,
+                        }
+                    )
+
+            scaffold_df = pd.DataFrame(scaffold_rows)
+
+        elif level == "between_replicates":
+            # For between-replicates analysis: calculate MAG pairs across different replicates
+            scaffold_rows = []
+
+            # Count MAGs per SGB per replicate
+            mag_counts_per_replicate = (
+                context_map_df.dropna(subset=["replicate"])
+                .groupby(["replicate", "SGB"])["MAG_ID"]
+                .nunique()
+                .unstack(fill_value=0)
             )
 
-            detailed_summary = stratified_summary.rename(
-                columns={
-                    "replicate1": "context_id",
-                    "SGB1_canonical": "SGB_MAG1",
-                    "SGB2_canonical": "SGB_MAG2",
-                }
-            )
+            if not mag_counts_per_replicate.empty:
+                replicate_list = list(mag_counts_per_replicate.index)
+                sgb_columns = list(mag_counts_per_replicate.columns)
 
-            aggregated_summary = (
-                detailed_summary.groupby(["SGB_MAG1", "SGB_MAG2"])
-                .agg(
-                    sum_interacting_mag_pairs=("interacting_mag_pairs", "sum"),
-                    mean_interacting_mag_pairs=("interacting_mag_pairs", "mean"),
-                    sum_total_number_of_HGTs=("total_number_of_HGTs", "sum"),
-                    mean_total_number_of_HGTs=("total_number_of_HGTs", "mean"),
-                    sum_total_possible_mag_pairs=("total_possible_mag_pairs", "sum"),
-                    mean_total_possible_mag_pairs=("total_possible_mag_pairs", "mean"),
-                )
-                .reset_index()
-            )
+                # For each pair of replicates
+                for replicate_first, replicate_second in combinations(
+                    replicate_list, 2
+                ):
+                    replicate_first_counts = mag_counts_per_replicate.loc[
+                        replicate_first
+                    ]
+                    replicate_second_counts = mag_counts_per_replicate.loc[
+                        replicate_second
+                    ]
 
-            results[level] = {
-                "detailed_summary": detailed_summary,
-                "aggregated_summary": aggregated_summary,
+                    # For each SGB pair, calculate cross-replicate interactions
+                    for sgb_first, sgb_second in combinations(sgb_columns, 2):
+                        # Bidirectional interactions between replicates:
+                        # (SGB1_rep1 × SGB2_rep2) + (SGB1_rep2 × SGB2_rep1)
+                        cross_replicate_pairs = int(
+                            replicate_first_counts.get(sgb_first, 0)
+                            * replicate_second_counts.get(sgb_second, 0)
+                            + replicate_second_counts.get(sgb_first, 0)
+                            * replicate_first_counts.get(sgb_second, 0)
+                        )
+
+                        scaffold_rows.append(
+                            {
+                                "context_id": tuple(
+                                    sorted((replicate_first, replicate_second))
+                                ),
+                                "SGB_MAG1": sgb_first,
+                                "SGB_MAG2": sgb_second,
+                                "total_possible_mag_pairs": cross_replicate_pairs,
+                            }
+                        )
+
+            scaffold_df = pd.DataFrame(scaffold_rows)
+
+        # === OBSERVED HITS PROCESSING ===
+        # For non-global levels, process observed hits and merge with scaffold
+        if level != "global":
+            # Define grouping columns for aggregating observed hits by context
+            level_grouping_columns = {
+                "within_mouse": ["sample_id1", "SGB1_canonical", "SGB2_canonical"],
+                "within_replicate": ["replicate1", "SGB1_canonical", "SGB2_canonical"],
+                "between_replicates": [
+                    "replicate_pair",
+                    "SGB1_canonical",
+                    "SGB2_canonical",
+                ],
             }
 
-        # --- Between-Replicates Level (Stratified) ---
-        elif level == "between_replicates":
-            df_subset["replicate_pair"] = df_subset.apply(
-                lambda row: tuple(sorted((row["replicate1"], row["replicate2"]))),
-                axis=1,
-            )
-
-            detailed_summary = (
-                df_subset.groupby(
-                    ["replicate_pair", "SGB1_canonical", "SGB2_canonical"]
+            # Special handling for between_replicates: create replicate pair identifiers
+            if level == "between_replicates":
+                hits_subset["replicate_pair"] = hits_subset.apply(
+                    lambda row: tuple(sorted((row["replicate1"], row["replicate2"]))),
+                    axis=1,
                 )
+
+            # Aggregate observed hits by context and SGB pair
+            observed_hits_summary = (
+                hits_subset.groupby(level_grouping_columns[level])
                 .agg(
-                    interacting_mag_pairs=("canonical_pair_key", "nunique"),
-                    total_number_of_HGTs=("canonical_pair_key", "size"),
+                    interacting_mag_pairs=(
+                        "canonical_pair_key",
+                        "nunique",
+                    ),
+                    total_number_of_HGTs=(
+                        "canonical_pair_key",
+                        "size",
+                    ),
                 )
                 .reset_index()
             )
 
-            def get_between_replicate_denominator(row):
-                rep1_id, rep2_id = row["replicate_pair"]
-                sgb1, sgb2 = row["SGB1_canonical"], row["SGB2_canonical"]
-                rep1_counts = (
-                    context_map_df[context_map_df["replicate"] == rep1_id]
-                    .groupby("SGB")["MAG_ID"]
-                    .nunique()
-                )
-                rep2_counts = (
-                    context_map_df[context_map_df["replicate"] == rep2_id]
-                    .groupby("SGB")["MAG_ID"]
-                    .nunique()
-                )
-                r1_sgb1, r1_sgb2 = rep1_counts.get(sgb1, 0), rep1_counts.get(sgb2, 0)
-                r2_sgb1, r2_sgb2 = rep2_counts.get(sgb1, 0), rep2_counts.get(sgb2, 0)
-                return (r1_sgb1 * r2_sgb2) + (r2_sgb1 * r1_sgb2)
-
-            detailed_summary["total_possible_mag_pairs"] = detailed_summary.apply(
-                get_between_replicate_denominator, axis=1
-            )
-
-            detailed_summary.rename(
+            # Standardize column names for merging with scaffold
+            context_column_mapping = {
+                "within_mouse": "sample_id1",
+                "within_replicate": "replicate1",
+                "between_replicates": "replicate_pair",
+            }
+            observed_hits_summary.rename(
                 columns={
-                    "replicate_pair": "context_id",
+                    context_column_mapping[level]: "context_id",
                     "SGB1_canonical": "SGB_MAG1",
                     "SGB2_canonical": "SGB_MAG2",
                 },
                 inplace=True,
             )
 
-            aggregated_summary = (
-                detailed_summary.groupby(["SGB_MAG1", "SGB_MAG2"])
-                .agg(
-                    sum_interacting_mag_pairs=("interacting_mag_pairs", "sum"),
-                    mean_interacting_mag_pairs=("interacting_mag_pairs", "mean"),
-                    sum_total_number_of_HGTs=("total_number_of_HGTs", "sum"),
-                    mean_total_number_of_HGTs=("total_number_of_HGTs", "mean"),
-                    sum_total_possible_mag_pairs=("total_possible_mag_pairs", "sum"),
-                    mean_total_possible_mag_pairs=("total_possible_mag_pairs", "mean"),
-                )
-                .reset_index()
+            # Merge scaffold (all possible contexts/pairs) with observed hits
+            # Left join ensures we keep all possible pairs, even those with zero hits
+            detailed_summary = pd.merge(
+                scaffold_df,
+                observed_hits_summary,
+                on=["context_id", "SGB_MAG1", "SGB_MAG2"],
+                how="left",
             )
 
-            results[level] = {
-                "detailed_summary": detailed_summary,
-                "aggregated_summary": aggregated_summary,
-            }
+            # Fill missing values (no hits) with zeros and ensure integer types
+            detailed_summary[["interacting_mag_pairs", "total_number_of_HGTs"]] = (
+                detailed_summary[["interacting_mag_pairs", "total_number_of_HGTs"]]
+                .fillna(0)
+                .astype(int)
+            )
 
-        # --- Global Level (Aggregated Only) ---
-        elif level == "global":
-            # Aggregate hits for the global level.
-            aggregated_summary = (
-                df_subset.groupby(["SGB1_canonical", "SGB2_canonical"])
+            # Calculate percentage of possible MAG pairs that actually interact
+            detailed_summary["percentage_interacting"] = np.where(
+                detailed_summary["total_possible_mag_pairs"] > 0,
+                100.0
+                * detailed_summary["interacting_mag_pairs"]
+                / detailed_summary["total_possible_mag_pairs"],
+                np.nan,  # Undefined when no possible pairs exist
+            )
+
+        # === GLOBAL LEVEL PROCESSING ===
+        # Global level uses different logic - no context stratification
+        if level == "global":
+            # Count total unique MAGs per SGB across all contexts
+            total_mags_per_sgb = context_map_df.groupby("SGB")["MAG_ID"].nunique()
+
+            # Calculate global denominators for all SGB pairs
+            global_denominators = master_sgb_pairs_df.copy()
+            global_denominators["sum_total_possible_mag_pairs"] = (
+                global_denominators.apply(
+                    lambda row: int(
+                        total_mags_per_sgb.get(row["SGB_MAG1"], 0)
+                        * total_mags_per_sgb.get(row["SGB_MAG2"], 0)
+                    ),
+                    axis=1,
+                )
+            )
+
+            # Aggregate all observed hits globally by SGB pair
+            global_hits_aggregated = (
+                hits_subset.groupby(["SGB1_canonical", "SGB2_canonical"])
                 .agg(
                     sum_interacting_mag_pairs=("canonical_pair_key", "nunique"),
                     sum_total_number_of_HGTs=("canonical_pair_key", "size"),
                 )
                 .reset_index()
-            )
-
-            # Calculate the global denominator.
-            sgb_counts = context_map_df.groupby("SGB")["MAG_ID"].nunique()
-            aggregated_summary["sum_total_possible_mag_pairs"] = (
-                aggregated_summary.apply(
-                    lambda row: sgb_counts.get(row["SGB1_canonical"], 0)
-                    * sgb_counts.get(row["SGB2_canonical"], 0),
-                    axis=1,
+                .rename(
+                    columns={"SGB1_canonical": "SGB_MAG1", "SGB2_canonical": "SGB_MAG2"}
                 )
             )
 
-            aggregated_summary.rename(
-                columns={"SGB1_canonical": "SGB_MAG1", "SGB2_canonical": "SGB_MAG2"},
-                inplace=True,
-            )
-            results[level] = {
-                "detailed_summary": pd.DataFrame(),
-                "aggregated_summary": aggregated_summary,
+            # Merge denominators with observed hits (left join keeps all SGB pairs)
+            aggregated_summary = global_denominators.merge(
+                global_hits_aggregated, on=["SGB_MAG1", "SGB_MAG2"], how="left"
+            ).fillna(0)
+
+            # Ensure correct data types for numeric columns
+            numeric_columns_to_cast = {
+                "sum_total_possible_mag_pairs": int,
+                "sum_interacting_mag_pairs": int,
+                "sum_total_number_of_HGTs": int,
             }
+            aggregated_summary = aggregated_summary.astype(
+                {
+                    column_name: data_type
+                    for column_name, data_type in numeric_columns_to_cast.items()
+                    if column_name in aggregated_summary.columns
+                }
+            )
+
+            # Global level has no context-specific detailed summary
+            detailed_summary = pd.DataFrame()
 
         else:
-            raise ValueError(f"Unknown analysis level provided: {level}")
+            # For non-global levels: create aggregated summary from detailed summary
+            # Aggregate across all contexts to get SGB-pair level summaries
+            aggregated_summary = (
+                detailed_summary.groupby(["SGB_MAG1", "SGB_MAG2"])
+                .agg(
+                    sum_interacting_mag_pairs=("interacting_mag_pairs", "sum"),
+                    mean_interacting_mag_pairs=("interacting_mag_pairs", "mean"),
+                    sum_total_number_of_HGTs=("total_number_of_HGTs", "sum"),
+                    mean_total_number_of_HGTs=("total_number_of_HGTs", "mean"),
+                    sum_total_possible_mag_pairs=("total_possible_mag_pairs", "sum"),
+                    mean_total_possible_mag_pairs=("total_possible_mag_pairs", "mean"),
+                )
+                .reset_index()
+            )
 
-        # --- Final Percentage Calculation for all summaries ---
-        for summary_type in ["detailed_summary", "aggregated_summary"]:
-            summary_df = results[level][summary_type]
-            if not summary_df.empty and (
-                "total_possible_mag_pairs" in summary_df.columns
-                or "sum_total_possible_mag_pairs" in summary_df.columns
-            ):
-                # Use the sum for the aggregated percentage calculation
-                numerator_col = (
-                    "sum_interacting_mag_pairs"
-                    if "sum_interacting_mag_pairs" in summary_df.columns
-                    else "interacting_mag_pairs"
-                )
-                denominator_col = (
-                    "sum_total_possible_mag_pairs"
-                    if "sum_total_possible_mag_pairs" in summary_df.columns
-                    else "total_possible_mag_pairs"
-                )
+        # Store both detailed and aggregated summaries for this level
+        results[level] = {
+            "detailed_summary": detailed_summary,
+            "aggregated_summary": aggregated_summary,
+        }
 
-                summary_df["percentage_interacting"] = np.where(
-                    summary_df[denominator_col] > 0,
-                    (summary_df[numerator_col] / summary_df[denominator_col]) * 100,
-                    0,
-                )
     return results
 
 
@@ -600,6 +704,10 @@ def process_blast_file(
     inter_sgb_df["canonical_pair_key"] = mag1c.str.cat(mag2c, sep="|")
 
     # Define boolean masks for each analysis level based on sample and replicate IDs.
+    # Note: These categories are mutually exclusive by design:
+    # - "within_mouse": Same sample_id (intra-individual)
+    # - "within_replicate": Same replicate but different sample_id (inter-individual, intra-replicate)
+    # - "between_replicates": Different replicate (inter-replicate)
     within_mouse = inter_sgb_df["sample_id1"] == inter_sgb_df["sample_id2"]
     within_replicate_only = (
         inter_sgb_df["replicate1"] == inter_sgb_df["replicate2"]
@@ -633,22 +741,26 @@ def process_blast_file(
 def perform_count_based_tests(
     comp_df: pd.DataFrame, focus_suffix: str, baseline_suffix: str
 ) -> pd.DataFrame:
-    """Compute one-tailed Binomial and Poisson p-values on aggregated counts.
+    """Compute statistical significance tests comparing hit counts between two conditions.
 
-    Expects `comp_df` to be an inner-merge of aggregated summaries from the two
-    conditions. Column names are suffixed (e.g., `sum_interacting_mag_pairs` +
-    suffix). Adds columns:
-      - `p_high_binomial`, `p_low_binomial`
-      - `p_high_poisson`, `p_low_poisson`
-      - `effect_direction` in {enriched, depleted, no_change}
+    Performs both Binomial and Poisson tests to assess whether the focus condition
+    has significantly more or fewer hits than expected based on the baseline condition.
 
     Args:
-        comp_df: Merged aggregated DataFrame with required suffixed columns.
-        focus_suffix: Suffix for the focus condition (e.g., `_GroupA_T0`).
-        baseline_suffix: Suffix for the baseline condition.
+        comp_df: Merged DataFrame containing aggregated summaries from both conditions
+            with suffixed column names (e.g., 'sum_interacting_mag_pairs_GroupA_T0')
+        focus_suffix: Suffix identifying the focus condition columns (e.g., '_GroupA_T0')
+        baseline_suffix: Suffix identifying the baseline condition columns (e.g., '_GroupB_T0')
 
     Returns:
-        DataFrame with added p-value and effect-direction columns.
+        DataFrame with added statistical test columns:
+            - p_high_binomial/p_high_poisson: P-value for enrichment (focus > baseline rate)
+            - p_low_binomial/p_low_poisson: P-value for depletion (focus < baseline rate)
+            - effect_direction: 'enriched', 'depleted', or 'no_change'
+
+    Note:
+        Uses a pseudocount approach when baseline has zero hits to avoid infinite significance.
+        Both tests assess the same hypothesis but with different distributional assumptions.
     """
     logger.info(
         "Performing count-based statistical comparison (Binomial and Poisson)..."
@@ -670,14 +782,31 @@ def perform_count_based_tests(
         baseline_hits = int(row[baseline_hits_col])
         baseline_trials = int(row[baseline_trials_col])
 
-        baseline_rate = baseline_hits / baseline_trials
+        # Implement pseudocount logic if baseline (control) hits are zero.
+        # This prevents a rate of 0, which would make any non-zero focus count
+        # infinitely significant. Instead, we use a very small positive rate.
+        if baseline_hits == 0:
+            baseline_rate = (1 / baseline_trials) - EPS
+            baseline_rate = max(EPS, baseline_rate)  # Ensure rate is not negative
+        else:
+            baseline_rate = baseline_hits / baseline_trials
+
+        # Calculate expected number of hits in focus condition based on baseline rate
         poisson_mean = focus_trials * baseline_rate
 
-        p_high_binomial = binom.sf(focus_hits - 1, focus_trials, baseline_rate)
-        p_low_binomial = binom.cdf(focus_hits, focus_trials, baseline_rate)
-        p_high_poisson = poisson.sf(focus_hits - 1, poisson_mean)
-        p_low_poisson = poisson.cdf(focus_hits, poisson_mean)
+        # Calculate one-tailed p-values for both directions
+        # sf() = survival function = P(X > k) = 1 - P(X <= k)
+        # cdf() = cumulative distribution function = P(X <= k)
+        p_high_binomial = binom.sf(
+            focus_hits - 1, focus_trials, baseline_rate
+        )  # P(X >= focus_hits)
+        p_low_binomial = binom.cdf(
+            focus_hits, focus_trials, baseline_rate
+        )  # P(X <= focus_hits)
+        p_high_poisson = poisson.sf(focus_hits - 1, poisson_mean)  # P(X >= focus_hits)
+        p_low_poisson = poisson.cdf(focus_hits, poisson_mean)  # P(X <= focus_hits)
 
+        # Determine effect direction based on comparison to expected value
         effect_direction = (
             "enriched"
             if focus_hits > poisson_mean
@@ -1009,7 +1138,19 @@ def plot_data(
 
 
 def main():
-    """Main entry point for the script."""
+    """Main entry point for HGT comparison analysis.
+
+    Workflow overview:
+    1. Parse command-line arguments for input files and parameters
+    2. Load and validate input data (BLAST files, mapping files)
+    3. Process each BLAST file: filter, map to context, classify hits
+    4. Calculate denominators (possible MAG pairs) for statistical comparison
+    5. For each analysis level: merge data, calculate statistics, generate plots
+    6. Save all results to output directory
+
+    The analysis compares HGT patterns between two experimental conditions
+    across multiple biological scales (global, within-mouse, etc.).
+    """
     # --- Argument Parsing ---
     # Sets up the command-line interface for the user to provide input files and parameters.
     parser = argparse.ArgumentParser(
@@ -1107,6 +1248,7 @@ def main():
     args = parser.parse_args()
 
     # --- Initial Setup ---
+    # Configure logging and create output directory
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -1121,25 +1263,26 @@ def main():
         )
         sys.exit(1)
 
-    # --- Data Loading ---
+    # --- Data Loading Phase ---
     # Load the mapping file, which connects MAGs to SGBs and experimental context.
+    logger.info("Loading mapping and contig files...")
     required_cols = [
         "MAG_ID",
         "SGB",
         "sample_id",
         "replicate",
-        "subjectID",
+        # "subjectID",
         "time",
         "group",
     ]
     map_df = pd.read_csv(args.mapping_file, usecols=required_cols, sep="\t")
 
-    # Optional contig→MAG mapping
-    # Load contig→MAG mapping (required)
+    # Load contig→MAG mapping (required for sequence ID to MAG ID conversion)
     contig_map_df = pd.read_csv(args.contig_map, sep="\t")
 
-    # --- Core Processing ---
-    # Process each of the two BLAST files to get summary statistics.
+    # --- Core Processing Phase ---
+    # Process each BLAST file: filter hits, map to context, classify by analysis level
+    logger.info("Processing BLAST files...")
     results1, inter_sgb_df1 = process_blast_file(
         args.blast1,
         map_df,
@@ -1161,8 +1304,22 @@ def main():
         contig_map_df,
     )
 
-    # --- Comparison Setup ---
-    # Create unique suffixes and labels for tables and plots.
+    # Save the detailed classified hits for user inspection.
+    if not inter_sgb_df1.empty:
+        inter_sgb_df1.to_csv(
+            args.output_dir / f"{args.prefix}_classified_hits{suffix1}.tsv",
+            sep="\t",
+            index=False,
+        )
+    if not inter_sgb_df2.empty:
+        inter_sgb_df2.to_csv(
+            args.output_dir / f"{args.prefix}_classified_hits{suffix2}.tsv",
+            sep="\t",
+            index=False,
+        )
+    # --- Comparison Setup Phase ---
+    # Create unique identifiers and determine focus vs baseline conditions
+    logger.info("Setting up comparison between conditions...")
     suffix1, suffix2 = (
         f"_{args.group1}_{args.timepoint1}",
         f"_{args.group2}_{args.timepoint2}",
@@ -1182,134 +1339,143 @@ def main():
     logger.info(
         f"Focus condition: {focus_label}. Baseline condition: {baseline_label}."
     )
-
-    # Save the detailed classified hits for user inspection.
-    if not inter_sgb_df1.empty:
-        inter_sgb_df1.to_csv(
-            args.output_dir / f"{args.prefix}_classified_hits{suffix1}.tsv",
-            sep="\t",
-            index=False,
-        )
-    if not inter_sgb_df2.empty:
-        inter_sgb_df2.to_csv(
-            args.output_dir / f"{args.prefix}_classified_hits{suffix2}.tsv",
-            sep="\t",
-            index=False,
-        )
-
-    # --- Analysis Loop ---
-    # Loop through each analysis level to compare the two conditions.
     for level in ["global", "within_mouse", "within_replicate", "between_replicates"]:
         logger.info("=" * 20 + f" COMPARISON FOR: {level.upper()} " + "=" * 20)
 
-        # Extract the summary data for the current level.
         detailed1 = results1.get(level, {}).get("detailed_summary", pd.DataFrame())
-        aggregated1 = results1.get(level, {}).get("aggregated_summary", pd.DataFrame())
         detailed2 = results2.get(level, {}).get("detailed_summary", pd.DataFrame())
+        aggregated1 = results1.get(level, {}).get("aggregated_summary", pd.DataFrame())
         aggregated2 = results2.get(level, {}).get("aggregated_summary", pd.DataFrame())
 
-        # Save the individual summary tables for each group.
-        if not detailed1.empty:
-            detailed1.to_csv(
-                args.output_dir
-                / f"{args.prefix}_{level}_detailed_summary{suffix1}.tsv",
-                sep="\t",
-                index=False,
-            )
-        if not aggregated1.empty:
-            aggregated1.to_csv(
-                args.output_dir
-                / f"{args.prefix}_{level}_aggregated_summary{suffix1}.tsv",
-                sep="\t",
-                index=False,
-            )
-        if not detailed2.empty:
-            detailed2.to_csv(
-                args.output_dir
-                / f"{args.prefix}_{level}_detailed_summary{suffix2}.tsv",
-                sep="\t",
-                index=False,
-            )
-        if not aggregated2.empty:
-            aggregated2.to_csv(
-                args.output_dir
-                / f"{args.prefix}_{level}_aggregated_summary{suffix2}.tsv",
-                sep="\t",
-                index=False,
-            )
-
-        # --- Perform Statistical Comparisons ---
-        if not aggregated1.empty and not aggregated2.empty:
-            # Merge the aggregated summaries for count-based tests and plotting.
-            comp_df = pd.merge(
-                aggregated1,
-                aggregated2,
-                on=["SGB_MAG1", "SGB_MAG2"],
-                how="inner",
-                suffixes=(suffix1, suffix2),
-            )
-
-            # Perform count-based tests (Binomial, Poisson) on the aggregated data.
-            comp_df = perform_count_based_tests(comp_df, focus_suffix, baseline_suffix)
-
-            # For stratified levels, perform distributional tests.
-            if level in ["within_mouse", "within_replicate", "between_replicates"]:
-                dist_test_results = perform_distributional_tests(
-                    detailed1, detailed2, level, args.min_samples
+        # Save individual summary tables, filtering detailed tables to only show contexts with hits
+        summaries_to_save = [
+            (detailed1, "detailed_summary", suffix1, "interacting_mag_pairs"),
+            (detailed2, "detailed_summary", suffix2, "interacting_mag_pairs"),
+            (aggregated1, "aggregated_summary", suffix1, None),
+            (aggregated2, "aggregated_summary", suffix2, None),
+        ]
+        for df, summary_type, suffix, filter_col in summaries_to_save:
+            if not df.empty:
+                # Only save the detailed summary if there are interacting MAG pairs
+                df_to_save = df[df[filter_col] > 0] if filter_col else df
+                out_path = (
+                    args.output_dir
+                    / f"{args.prefix}_{level}_{summary_type}{suffix}.tsv"
                 )
+                df_to_save.to_csv(out_path, sep="\t", index=False)
+
+        # Combine summaries for comparison
+        comp_df = pd.merge(
+            aggregated1,
+            aggregated2,
+            on=["SGB_MAG1", "SGB_MAG2"],
+            how="outer",
+            suffixes=(suffix1, suffix2),
+        )
+        comp_df.fillna(0, inplace=True)
+        for root in [
+            "sum_interacting_mag_pairs",
+            "sum_total_number_of_HGTs",
+            "sum_total_possible_mag_pairs",
+        ]:
+            for suf in (suffix1, suffix2):
+                col = f"{root}{suf}"
+                if col in comp_df.columns:
+                    comp_df[col] = comp_df[col].astype(int)
+
+        # Calculate percentages after the merge is complete and NaNs are filled
+        denom_col1, denom_col2 = (
+            f"sum_total_possible_mag_pairs{suffix1}",
+            f"sum_total_possible_mag_pairs{suffix2}",
+        )
+        num_col1, num_col2 = (
+            f"sum_interacting_mag_pairs{suffix1}",
+            f"sum_interacting_mag_pairs{suffix2}",
+        )
+        comp_df[f"percentage_interacting{suffix1}"] = np.where(
+            comp_df[denom_col1] > 0, (comp_df[num_col1] / comp_df[denom_col1]) * 100, 0
+        )
+        comp_df[f"percentage_interacting{suffix2}"] = np.where(
+            comp_df[denom_col2] > 0, (comp_df[num_col2] / comp_df[denom_col2]) * 100, 0
+        )
+
+        initial_rows = len(comp_df)
+        comp_df = comp_df[(comp_df[denom_col1] + comp_df[denom_col2]) > 0]
+
+        logger.info(
+            f"Filtered out {initial_rows - len(comp_df)} rows with no activity in either group."
+        )
+        if comp_df.empty:
+            logger.warning(
+                f"No SGB pairs with activity to compare for level '{level}'. Skipping."
+            )
+            continue
+
+        # Perform count-based tests (Binomial, Poisson) on the aggregated data.
+        comp_df = perform_count_based_tests(comp_df, focus_suffix, baseline_suffix)
+
+        # For stratified levels, perform distributional tests.
+        if level in ["within_mouse", "within_replicate", "between_replicates"]:
+            # Keep only contexts with at least one interacting MAG pair
+            detailed1 = detailed1[detailed1["interacting_mag_pairs"] > 0].copy()
+            detailed2 = detailed2[detailed2["interacting_mag_pairs"] > 0].copy()
+
+            dist_test_results = perform_distributional_tests(
+                detailed1, detailed2, level, args.min_samples
+            )
+            if not dist_test_results.empty:
                 comp_df = pd.merge(
                     comp_df, dist_test_results, on=["SGB_MAG1", "SGB_MAG2"], how="left"
                 )
 
-            # Save the final comparison table with all statistical results.
-            comp_df.to_csv(
-                args.output_dir / f"{args.prefix}_{level}_statistical_comparison.tsv",
-                sep="\t",
-                index=False,
+        # Save the final comparison table with all statistical results.
+        comp_df.to_csv(
+            args.output_dir / f"{args.prefix}_{level}_statistical_comparison.tsv",
+            sep="\t",
+            index=False,
+        )
+
+        # --- Visualization Phase (optional) ---
+        # Generate plots if requested by the user to visualize the comparisons
+        if args.plot:
+            # Plot 1: Interaction percentages between conditions
+            plot_data(
+                comp_df,
+                "percentage_interacting",
+                "% of MAG pairs with >=1 BLAST hit",
+                f"Interaction Percentage ({level})",
+                suffix1,
+                suffix2,
+                plot_label1,
+                plot_label2,
+                args.output_dir,
+                args.prefix,
             )
-            logging.info(f"\n--- Statistical Comparison Table ({level}) ---")
-            # Generate plots if requested by the user.
-            if args.plot:
-                plot_data(
-                    comp_df,
-                    "percentage_interacting",
-                    "% of MAG pairs with >=1 BLAST hit",
-                    f"Interaction Percentage ({level})",
-                    suffix1,
-                    suffix2,
-                    plot_label1,
-                    plot_label2,
-                    args.output_dir,
-                    args.prefix,
-                )
-                plot_data(
-                    comp_df,
-                    "sum_total_number_of_HGTs",
-                    "Total number of HGTs",
-                    f"Total number of HGTs ({level})",
-                    suffix1,
-                    suffix2,
-                    plot_label1,
-                    plot_label2,
-                    args.output_dir,
-                    args.prefix,
-                )
-                # The statistical scatter plot can be generated for any level with p-values.
-                plot_statistical_results(
-                    comp_df,
-                    baseline_suffix,
-                    focus_suffix,
-                    baseline_label,
-                    focus_label,
-                    level,
-                    args.stat_plot_type,
-                    args.alpha,
-                    args.output_dir,
-                    args.prefix,
-                )
-        else:
-            logger.warning(
-                f"One or both files had no data for the '{level}' level. Skipping comparison."
+            # Plot 2: Total HGT counts between conditions
+            plot_data(
+                comp_df,
+                "sum_total_number_of_HGTs",
+                "Total number of HGTs",
+                f"Total number of HGTs ({level})",
+                suffix1,
+                suffix2,
+                plot_label1,
+                plot_label2,
+                args.output_dir,
+                args.prefix,
+            )
+            # Plot 3: Statistical significance scatter plot with color coding
+            plot_statistical_results(
+                comp_df,
+                baseline_suffix,
+                focus_suffix,
+                baseline_label,
+                focus_label,
+                level,
+                args.stat_plot_type,
+                args.alpha,
+                args.output_dir,
+                args.prefix,
             )
 
 
