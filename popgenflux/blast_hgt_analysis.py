@@ -1304,19 +1304,6 @@ def main():
         contig_map_df,
     )
 
-    # Save the detailed classified hits for user inspection.
-    if not inter_sgb_df1.empty:
-        inter_sgb_df1.to_csv(
-            args.output_dir / f"{args.prefix}_classified_hits{suffix1}.tsv",
-            sep="\t",
-            index=False,
-        )
-    if not inter_sgb_df2.empty:
-        inter_sgb_df2.to_csv(
-            args.output_dir / f"{args.prefix}_classified_hits{suffix2}.tsv",
-            sep="\t",
-            index=False,
-        )
     # --- Comparison Setup Phase ---
     # Create unique identifiers and determine focus vs baseline conditions
     logger.info("Setting up comparison between conditions...")
@@ -1336,6 +1323,19 @@ def main():
         focus_suffix, baseline_suffix = suffix2, suffix1
         focus_label, baseline_label = plot_label2, plot_label1
 
+    # Save the detailed classified hits for user inspection.
+    if not inter_sgb_df1.empty:
+        inter_sgb_df1.to_csv(
+            args.output_dir / f"{args.prefix}_classified_hits{suffix1}.tsv",
+            sep="\t",
+            index=False,
+        )
+    if not inter_sgb_df2.empty:
+        inter_sgb_df2.to_csv(
+            args.output_dir / f"{args.prefix}_classified_hits{suffix2}.tsv",
+            sep="\t",
+            index=False,
+        )
     logger.info(
         f"Focus condition: {focus_label}. Baseline condition: {baseline_label}."
     )
